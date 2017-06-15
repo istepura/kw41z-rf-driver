@@ -425,6 +425,7 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_CCATYPE_MASK;
     ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCATYPE(gCcaCCA_MODE1_c);    
 
+    mac_tx_handle = tx_handle;
     need_ack = (*data_ptr & 0x20) == 0x20;
 
     /* Set XCVR power state in run mode */
