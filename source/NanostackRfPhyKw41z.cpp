@@ -59,6 +59,8 @@ static NanostackRfPhyKw41z *rf = NULL;
 static Thread irq_thread(osPriorityRealtime, 1024);
 static phy_device_driver_s device_driver;
 static int8_t  rf_radio_driver_id = -1;
+static uint8_t  mac_tx_handle = 0;
+
 static uint8_t                         mPhyIrqDisableCnt = 1;
 static uint8_t rf_phy_channel = 0;
 static uint8_t  need_ack = 0;
@@ -109,9 +111,7 @@ MBED_UNUSED static void    rf_promiscuous(uint8_t mode);
 MBED_UNUSED static void rf_receive(void);
 MBED_UNUSED static void rf_mac64_read(uint8_t *address);
 MBED_UNUSED static void    rf_set_power_state(phyPwrMode_t newState);
-
-
-
+MBED_UNUSED static void rf_handle_tx_end(uint8_t);
 
 
 static void PHY_InterruptHandler(void);
@@ -454,6 +454,7 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
     /* Unmask SEQ interrupt */
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_SEQMSK_MASK;    
 
+    return 0;
 }
 
 
@@ -798,11 +799,11 @@ static void handle_interrupt(void)
             case gTX_c:
                 if( (ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCABFRTX_MASK) && (irqStatus & ZLL_IRQSTS_CCA_MASK ) )
                 {
-                    //Radio_Phy_PlmeCcaConfirm(gPhyChannelBusy_c, mPhyInstance);
+                     device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
                 }
                 else
                 {
-                    //Radio_Phy_PdDataConfirm(mPhyInstance, FALSE);
+                    rf_handle_tx_end(0);
                 }
                 break;
                 
@@ -814,7 +815,8 @@ static void handle_interrupt(void)
                 else
                 {
                     //Phy_GetRxParams();
-                    //Radio_Phy_PdDataConfirm(mPhyInstance, (irqStatus & ZLL_IRQSTS_RX_FRM_PEND_MASK) > 0);
+                    rf_handle_tx_end((irqStatus & ZLL_IRQSTS_RX_FRM_PEND_MASK) > 0);
+
                 }
                 break;
                 
@@ -852,10 +854,11 @@ static void handle_interrupt(void)
                 {
                     if( irqStatus & ZLL_IRQSTS_CCA_MASK )
                     {
-                        //Radio_Phy_PlmeCcaConfirm(gPhyChannelBusy_c, mPhyInstance);
+                        device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
                     }
                     else
                     {
+                        //rf_start_tx();
                         //Radio_Phy_PlmeCcaConfirm(gPhyChannelIdle_c, mPhyInstance);
                     }
                 }
@@ -907,6 +910,33 @@ static void handle_interrupt(void)
             ZLL->IRQSTS = irqStatus;
         }
     }
+}
+
+static void rf_handle_tx_end(uint8_t rx_frame_pending)
+{
+    rf_receive();
+
+    if (!device_driver.phy_tx_done_cb) {
+        return;
+    }
+    if( need_ack )
+    {
+        if( rx_frame_pending )
+        {
+            device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_DONE_PENDING, 1, 1);
+        }
+        else
+        {
+            // arm_net_phy_tx_done(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_SUCCESS, 1, 1);
+            device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_DONE, 1, 1);
+        }
+    }
+    else
+    {
+        device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_SUCCESS, 1, 1);
+    }
+
+
 }
 
 NanostackRfPhyKw41z::NanostackRfPhyKw41z()
