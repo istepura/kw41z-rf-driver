@@ -1,0 +1,17 @@
+{
+  "name": "kw41z-rf-driver",
+  "version": "0.0.1",
+  "description": "RF driver for NXP KW41Z",
+  "keywords": [
+    "rf",
+    "driver"
+  ],
+  "author": "Igor Stepura <igor.stepura@gmail.com>",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "nanostack-libservice": "^3.0.0",
+    "sal-stack-nanostack": "^5.0.0",
+    "mbed-drivers": "^1.0.0"
+  },
+  "targetDependencies": {}
+}
