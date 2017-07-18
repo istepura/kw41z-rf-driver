@@ -65,7 +65,9 @@ static uint8_t                         mPhyIrqDisableCnt = 1;
 static uint8_t rf_phy_channel = 0;
 static uint8_t  need_ack = 0;
 
-
+#define RF_BUFFER_SIZE 128
+/*RF receive buffer*/
+static uint8_t rf_buffer[RF_BUFFER_SIZE];
 
 /* Channel configurations for 2.4 */
 static const phy_rf_channel_configuration_s phy_24ghz = {2405000000U, 5000000U, 250000U, 16U, M_OQPSK};
@@ -112,6 +114,7 @@ MBED_UNUSED static void rf_receive(void);
 MBED_UNUSED static void rf_mac64_read(uint8_t *address);
 MBED_UNUSED static void    rf_set_power_state(phyPwrMode_t newState);
 MBED_UNUSED static void rf_handle_tx_end(uint8_t);
+static void rf_set_address(uint8_t *address);
 
 
 static void PHY_InterruptHandler(void);
@@ -235,7 +238,7 @@ static void PHY_InstallIsr()
 static void rf_channel_set(uint8_t channel)
 {
     rf_phy_channel = channel;
-    PhyPlmeSetCurrentChannelRequest(channel, 0); /* 2405 MHz */
+    PhyPlmeSetCurrentChannelRequest(channel, 0);
 }
 
 static void rf_init(void)
@@ -304,7 +307,7 @@ static void rf_init(void)
     ZLL->RX_WTR_MARK = 0;
 
     /*Read eui64*/
-    rf_mac64_read(MAC_address);
+    //rf_set_address(MAC_address);
     /*set default channel to 11*/
     rf_channel_set(12);
     /*Start receiver*/
@@ -368,8 +371,10 @@ static void rf_receive(void)
     irqSts |= ZLL_IRQSTS_TMR3MSK_MASK;
     ZLL->IRQSTS = irqSts;
 
+    ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_XCVSEQ_MASK);
     /* Start the RX sequence */
     ZLL->PHY_CTRL |= gRX_c ;
+    mPhyState = gRX_c;
     /* unmask SEQ interrupt */
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_SEQMSK_MASK;
 }
@@ -417,13 +422,26 @@ static int8_t rf_device_register(void)
 
 static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_handle, data_protocol_e data_protocol )
 {
+    if( mPhyState == gRX_c )
+    {
+        uint8_t phyReg = (ZLL->SEQ_STATE & ZLL_SEQ_STATE_SEQ_STATE_MASK);
+        /* Check for an Rx in progress. */
+        if((phyReg <= 0x06) || (phyReg == 0x15) || (phyReg == 0x16))
+        {
+            if (device_driver.phy_tx_done_cb) {
+                device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
+            }
+            return -1;
+        }
+        rf_abort();
+    }    
     uint8_t* pPB = (uint8_t*)ZLL->PKT_BUFFER_TX;
     pPB[0] = data_length + 2; /* including 2 bytes of FCS */
     memcpy(&pPB[1], data_ptr, data_length);
 
     ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCABFRTX_MASK;
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_CCATYPE_MASK;
-    ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCATYPE(gCcaCCA_MODE1_c);    
+    ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCATYPE(gCcaCCA_MODE1_c);
 
     mac_tx_handle = tx_handle;
     need_ack = (*data_ptr & 0x20) == 0x20;
@@ -437,6 +455,7 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
     {
         ZLL->PHY_CTRL |= ZLL_PHY_CTRL_RXACKRQD_MASK;
         xcvseq = gTR_c;
+    
     }
     else
     {
@@ -450,6 +469,7 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
     irqSts |= ZLL_IRQSTS_TMR3MSK_MASK;
     ZLL->IRQSTS = irqSts;
 
+    ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_XCVSEQ_MASK);
     /* Start the TX / TRX / CCA sequence */
     ZLL->PHY_CTRL |= xcvseq;
     /* Unmask SEQ interrupt */
@@ -457,7 +477,6 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
 
     return 0;
 }
-
 
 static void rf_set_short_adr(uint8_t * short_address)
 {
@@ -513,7 +532,18 @@ static int8_t rf_address_write(phy_address_type_e address_type, uint8_t *address
 
 static int8_t rf_extension(phy_extension_type_e extension_type, uint8_t *data_ptr)
 {
-    assert(0);
+    uint32_t type = (uint32_t)extension_type;
+    switch (type)
+    {
+        /*Return frame pending status*/
+        case PHY_EXTENSION_READ_LAST_ACK_PENDING_STATUS:
+            *data_ptr = ((ZLL->IRQSTS & ZLL_IRQSTS_RX_FRM_PEND_MASK) >> ZLL_IRQSTS_RX_FRM_PEND_SHIFT);
+            break;        
+        /*Read energy on the channel*/
+        case PHY_EXTENSION_READ_CHANNEL_ENERGY:
+            *data_ptr = 100;
+            break;            
+    }    
     return 0;
 }
 
@@ -646,6 +676,8 @@ static void rf_abort(void)
     /* clear all PP IRQ bits to avoid unexpected interrupts( do not change TMR1 and TMR4 IRQ status ) */
     ZLL->IRQSTS &= ~(ZLL_IRQSTS_TMR1IRQ_MASK | ZLL_IRQSTS_TMR4IRQ_MASK);
 
+    mPhyState = gIdle_c;
+
     rf_if_unlock();
 }
 
@@ -661,9 +693,8 @@ static void rf_abort(void)
 static void PHY_InterruptHandler(void)
 {
     /* Disable and clear transceiver(IRQ_B) interrupt */
-    //MCR20Drv_IRQ_Disable();
     //irq_thread.signal_set(1);
-        handle_interrupt();
+    handle_interrupt();
 }
 
 static void PHY_InterruptThread(void)
@@ -673,14 +704,14 @@ static void PHY_InterruptThread(void)
         if (event.status != osEventSignal) {
             continue;
         }
+        rf_if_lock();        
         handle_interrupt();
+        rf_if_unlock();
+
     }
 }
 
-static void PhyIsrSeqCleanup
-(
-  void
-)
+static void PhyIsrSeqCleanup(void)
 {
     uint32_t irqStatus;
 
@@ -705,10 +736,7 @@ static void PhyIsrSeqCleanup
     ZLL->IRQSTS = irqStatus;
 }
 
-static void PhyIsrTimeoutCleanup
-(
-  void
-)
+static void PhyIsrTimeoutCleanup(void)
 {
     uint32_t irqStatus;
 
@@ -731,6 +759,57 @@ static void PhyIsrTimeoutCleanup
     irqStatus &= ~( ZLL_IRQSTS_TMR1IRQ_MASK |
                     ZLL_IRQSTS_TMR4IRQ_MASK );
     ZLL->IRQSTS = irqStatus;
+}
+
+static inline uint8_t rf_convert_lqi(uint8_t rssi)
+{
+    if (rssi >= 220)
+    {
+        rssi = 255;
+    }
+    else
+    {
+        rssi = (51 * rssi) / 44;
+    }
+
+    return rssi;
+}
+
+static void rf_handle_rx_end(void)
+{
+    uint32_t irqSts;
+
+    rf_if_lock();
+    /* disable TMR3 compare */
+    ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TMR3CMP_EN_MASK;
+    /* disable autosequence stop by TC3 match */
+    ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TC3TMOUT_MASK;
+    /* mask TMR3 interrupt (do not change other IRQ status) */
+    irqSts  = ZLL->IRQSTS & (ZLL_IRQSTS_TMR1MSK_MASK |
+            ZLL_IRQSTS_TMR2MSK_MASK |
+            ZLL_IRQSTS_TMR3MSK_MASK |
+            ZLL_IRQSTS_TMR4MSK_MASK );
+    irqSts |= ZLL_IRQSTS_TMR3MSK_MASK;
+    /* aknowledge TMR3 IRQ */
+    irqSts |= ZLL_IRQSTS_TMR3IRQ_MASK;
+    ZLL->IRQSTS = irqSts;
+    rf_if_unlock();   
+
+    uint8_t rssi = (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_LQI_VALUE_MASK) >> ZLL_LQI_AND_RSSI_LQI_VALUE_SHIFT;
+    uint8_t lqi = rf_convert_lqi(rssi);
+    uint8_t psduLength = (ZLL->IRQSTS & ZLL_IRQSTS_RX_FRAME_LENGTH_MASK) >> ZLL_IRQSTS_RX_FRAME_LENGTH_SHIFT; /* Including FCS (2 bytes) */
+    uint8_t len = psduLength - 2;
+
+    rf_receive();
+    if (psduLength > 0 )
+    {
+        memcpy(rf_buffer,  (void*)ZLL->PKT_BUFFER_RX, len);
+
+        if (device_driver.phy_rx_cb) {
+            device_driver.phy_rx_cb(rf_buffer, len, lqi, rssi, rf_radio_driver_id);
+        }
+    }
+
 }
 
 static void handle_interrupt(void)
@@ -779,6 +858,7 @@ static void handle_interrupt(void)
     /* Sequencer interrupt, the autosequence has completed */
     if( (!(ZLL->PHY_CTRL & ZLL_PHY_CTRL_SEQMSK_MASK)) && (irqStatus & ZLL_IRQSTS_SEQIRQ_MASK) )
     {
+        mPhyState = gIdle_c;
         /* PLL unlock, the autosequence has been aborted due to PLL unlock */
         if( irqStatus & ZLL_IRQSTS_PLL_UNLOCK_IRQ_MASK )
         {
@@ -790,7 +870,7 @@ static void handle_interrupt(void)
             (gTX_c != xcvseqCopy) )
         {
             PhyIsrTimeoutCleanup();
-            //Radio_Phy_TimeRxTimeoutIndication(mPhyInstance);
+            device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_FAIL, 1, 1);
         }
         else
         {
@@ -804,6 +884,13 @@ static void handle_interrupt(void)
                 }
                 else
                 {
+                    ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_XCVSEQ_MASK;
+                    /* wait for Sequence Idle (if not already) */
+                    ZLL->PHY_CTRL |= (ZLL_PHY_CTRL_CCAMSK_MASK |
+                            ZLL_PHY_CTRL_RXMSK_MASK |
+                            ZLL_PHY_CTRL_TXMSK_MASK |
+                            ZLL_PHY_CTRL_SEQMSK_MASK);
+                    while( ZLL->SEQ_STATE & ZLL_SEQ_STATE_SEQ_STATE_MASK ) {}
                     rf_handle_tx_end(0);
                 }
                 break;
@@ -811,39 +898,17 @@ static void handle_interrupt(void)
             case gTR_c:
                 if( (ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCABFRTX_MASK) && (irqStatus & ZLL_IRQSTS_CCA_MASK ) )
                 {
-                    //Radio_Phy_PlmeCcaConfirm(gPhyChannelBusy_c, mPhyInstance);
+                    device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
                 }
                 else
                 {
-                    //Phy_GetRxParams();
                     rf_handle_tx_end((irqStatus & ZLL_IRQSTS_RX_FRM_PEND_MASK) > 0);
 
                 }
                 break;
                 
             case gRX_c:
-                /* Check SAA0 and SAA1 (source address absent) */
-                if( irqStatus & ZLL_IRQSTS_PI_MASK )
-                {
-#if 0
-                    if( PhyPpIsTxAckDataPending() )
-                    {
-                        phyLocal.flags |= gPhyFlagTxAckFP_c;
-                    }
-                    else
-                    {
-                        phyLocal.flags &= ~gPhyFlagTxAckFP_c;
-                    }
-                    
-                    if( ZLL->SAM_MATCH & (ZLL_SAM_MATCH_SAA0_ADDR_ABSENT_MASK | ZLL_SAM_MATCH_SAA1_ADDR_ABSENT_MASK) )
-                    {
-                        mPhyForceFP = TRUE;
-                    }
-#endif
-                }
-                
-                //Phy_GetRxParams();
-                //Radio_Phy_PdDataIndication(mPhyInstance);
+                rf_handle_rx_end();
                 break;
                 
             case gCCA_c:
@@ -859,8 +924,6 @@ static void handle_interrupt(void)
                     }
                     else
                     {
-                        //rf_start_tx();
-                        //Radio_Phy_PlmeCcaConfirm(gPhyChannelIdle_c, mPhyInstance);
                     }
                 }
                 break;
@@ -894,6 +957,7 @@ static void handle_interrupt(void)
             /* TMR3 can expire during R-T turnaround for example, case in which the sequence is not interrupted */
             if( gIdle_c == xcvseqCopy )
             {
+                //device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_FAIL, 1, 1);
                 //Radio_Phy_TimeRxTimeoutIndication(mPhyInstance);
             }
         }
@@ -955,7 +1019,7 @@ int8_t NanostackRfPhyKw41z::rf_register()
 
     if (rf != NULL) {
         rf_if_unlock();
-        error("Multiple registrations of NanostackRfPhyMcr20a not supported");
+        error("Multiple registrations of NanostackRfPhyKw41z not supported");
         return -1;
     }
 
