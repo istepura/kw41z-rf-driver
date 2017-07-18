@@ -650,7 +650,6 @@ static void rf_device_unregister(void)
 
 static void rf_abort(void)
 {
-    rf_if_lock();
     /* Mask SEQ interrupt */
     ZLL->PHY_CTRL |= ZLL_PHY_CTRL_SEQMSK_MASK;
     /* Disable timer trigger (for scheduled XCVSEQ) */
@@ -677,8 +676,6 @@ static void rf_abort(void)
     ZLL->IRQSTS &= ~(ZLL_IRQSTS_TMR1IRQ_MASK | ZLL_IRQSTS_TMR4IRQ_MASK);
 
     mPhyState = gIdle_c;
-
-    rf_if_unlock();
 }
 
 
@@ -779,7 +776,6 @@ static void rf_handle_rx_end(void)
 {
     uint32_t irqSts;
 
-    rf_if_lock();
     /* disable TMR3 compare */
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TMR3CMP_EN_MASK;
     /* disable autosequence stop by TC3 match */
@@ -793,7 +789,6 @@ static void rf_handle_rx_end(void)
     /* aknowledge TMR3 IRQ */
     irqSts |= ZLL_IRQSTS_TMR3IRQ_MASK;
     ZLL->IRQSTS = irqSts;
-    rf_if_unlock();   
 
     uint8_t rssi = (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_LQI_VALUE_MASK) >> ZLL_LQI_AND_RSSI_LQI_VALUE_SHIFT;
     uint8_t lqi = rf_convert_lqi(rssi);
