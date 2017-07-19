@@ -51,8 +51,6 @@ enum {
   gNormalCca_c,
   gContinuousCca_c
 };
-
-static phySeqState_t  mPhyState = gIdle_c;
 static phyPwrMode_t mPhyPwrState = gPhyPwrIdle_c;
 static uint8_t MAC_address[8] = {1, 2, 3, 4, 5, 6, 7, 8};
 static NanostackRfPhyKw41z *rf = NULL;
@@ -115,11 +113,15 @@ MBED_UNUSED static void rf_mac64_read(uint8_t *address);
 MBED_UNUSED static void    rf_set_power_state(phyPwrMode_t newState);
 MBED_UNUSED static void rf_handle_tx_end(uint8_t);
 static void rf_set_address(uint8_t *address);
+static inline phySeqState_t rf_get_state(void)
+{
+    return (phySeqState_t)(((ZLL->PHY_CTRL & ZLL_PHY_CTRL_XCVSEQ_MASK) >> ZLL_PHY_CTRL_XCVSEQ_SHIFT));
+} 
 
 
 static void PHY_InterruptHandler(void);
 static void PHY_InterruptThread(void);
-static void handle_interrupt(void);
+static void handle_interrupt(uint32_t irqStatus);
 
 static void rf_if_lock(void)
 {
@@ -359,7 +361,7 @@ static void rf_receive(void)
 {
     uint32_t irqSts;
     /* RX can start only from Idle state */
-    if( mPhyState != gIdle_c )
+    if( rf_get_state() != gIdle_c )
     {
         return;
     }
@@ -374,7 +376,6 @@ static void rf_receive(void)
     ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_XCVSEQ_MASK);
     /* Start the RX sequence */
     ZLL->PHY_CTRL |= gRX_c ;
-    mPhyState = gRX_c;
     /* unmask SEQ interrupt */
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_SEQMSK_MASK;
 }
@@ -422,7 +423,7 @@ static int8_t rf_device_register(void)
 
 static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_handle, data_protocol_e data_protocol )
 {
-    if( mPhyState == gRX_c )
+    if( rf_get_state() == gRX_c )
     {
         uint8_t phyReg = (ZLL->SEQ_STATE & ZLL_SEQ_STATE_SEQ_STATE_MASK);
         /* Check for an Rx in progress. */
@@ -448,7 +449,6 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
 
     /* Set XCVR power state in run mode */
     rf_set_power_state(gPhyPwrAutodoze_c);
-    mPhyState = gCCA_c;
 
     uint8_t xcvseq;    
     if(need_ack)
@@ -480,16 +480,15 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
 
 static void rf_set_short_adr(uint8_t * short_address)
 {
-    uint16_t value;
-    memcpy(&value, short_address, sizeof(value));
+    uint16_t value = ((uint16_t)short_address[0] << 8) | (uint16_t)short_address[1];
+    //memcpy(&value, short_address, sizeof(value));
     ZLL->MACSHORTADDRS0 &= ~ZLL_MACSHORTADDRS0_MACSHORTADDRS0_MASK;
     ZLL->MACSHORTADDRS0 |= ZLL_MACSHORTADDRS0_MACSHORTADDRS0(value);    
 }
 
 static void rf_set_pan_id(uint8_t *pan_id)
 {
-    uint16_t value;
-    memcpy(&value, pan_id, sizeof(value));
+    uint16_t value = ((uint16_t)pan_id[0] << 8) | (uint16_t)pan_id[1];
     ZLL->MACSHORTADDRS0 &= ~ZLL_MACSHORTADDRS0_MACPANID0_MASK;
     ZLL->MACSHORTADDRS0 |= ZLL_MACSHORTADDRS0_MACPANID0(value);
 }
@@ -674,8 +673,6 @@ static void rf_abort(void)
             ZLL_PHY_CTRL_TC3TMOUT_MASK );
     /* clear all PP IRQ bits to avoid unexpected interrupts( do not change TMR1 and TMR4 IRQ status ) */
     ZLL->IRQSTS &= ~(ZLL_IRQSTS_TMR1IRQ_MASK | ZLL_IRQSTS_TMR4IRQ_MASK);
-
-    mPhyState = gIdle_c;
 }
 
 
@@ -687,11 +684,12 @@ static void rf_abort(void)
  *
  * \return none
  */
+static volatile uint8_t gIrqStatus = 0;
 static void PHY_InterruptHandler(void)
 {
-    /* Disable and clear transceiver(IRQ_B) interrupt */
-    //irq_thread.signal_set(1);
-    handle_interrupt();
+    gIrqStatus = ZLL->IRQSTS;
+    ZLL->IRQSTS = gIrqStatus;
+    irq_thread.signal_set(1);
 }
 
 static void PHY_InterruptThread(void)
@@ -701,9 +699,9 @@ static void PHY_InterruptThread(void)
         if (event.status != osEventSignal) {
             continue;
         }
-        rf_if_lock();        
-        handle_interrupt();
-        rf_if_unlock();
+       // rf_if_lock();        
+        handle_interrupt(gIrqStatus);
+       // rf_if_unlock();
 
     }
 }
@@ -798,7 +796,10 @@ static void rf_handle_rx_end(void)
     rf_receive();
     if (psduLength > 0 )
     {
-        memcpy(rf_buffer,  (void*)ZLL->PKT_BUFFER_RX, len);
+        for (uint8_t i = 0; i < len; i++)
+        {
+            rf_buffer[i] = ((uint8_t*)ZLL->PKT_BUFFER_RX)[i];
+        }
 
         if (device_driver.phy_rx_cb) {
             device_driver.phy_rx_cb(rf_buffer, len, lqi, rssi, rf_radio_driver_id);
@@ -807,7 +808,7 @@ static void rf_handle_rx_end(void)
 
 }
 
-static void handle_interrupt(void)
+static void handle_interrupt(uint32_t irqStatus)
 {
  /* RSIM Wake-up IRQ */
     if(RSIM->DSM_CONTROL & RSIM_DSM_CONTROL_ZIG_SYSCLK_REQ_INT_MASK)
@@ -818,9 +819,6 @@ static void handle_interrupt(void)
 
     /* Read current XCVRSEQ and interrup status */
     uint32_t xcvseqCopy = ZLL->PHY_CTRL & ZLL_PHY_CTRL_XCVSEQ_MASK;
-    uint32_t irqStatus     = ZLL->IRQSTS;
-    /* Clear all xcvr interrupts */
-    ZLL->IRQSTS = irqStatus;
 
     /* WAKE IRQ */
     if( irqStatus & ZLL_IRQSTS_WAKE_IRQ_MASK )
@@ -853,7 +851,6 @@ static void handle_interrupt(void)
     /* Sequencer interrupt, the autosequence has completed */
     if( (!(ZLL->PHY_CTRL & ZLL_PHY_CTRL_SEQMSK_MASK)) && (irqStatus & ZLL_IRQSTS_SEQIRQ_MASK) )
     {
-        mPhyState = gIdle_c;
         /* PLL unlock, the autosequence has been aborted due to PLL unlock */
         if( irqStatus & ZLL_IRQSTS_PLL_UNLOCK_IRQ_MASK )
         {
