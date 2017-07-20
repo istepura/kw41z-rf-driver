@@ -493,13 +493,20 @@ static void rf_set_pan_id(uint8_t *pan_id)
     ZLL->MACSHORTADDRS0 |= ZLL_MACSHORTADDRS0_MACPANID0(value);
 }
 
+#define TO_UINT32(ptr, num) do {\
+    num = (((uint32_t)(ptr)[0] << 24) |\
+           ((uint32_t)(ptr)[1] << 16) |\
+           ((uint32_t)(ptr)[2] << 8) |\
+           ((uint32_t)(ptr)[3])); \
+}while(0)
+
 static void rf_set_address(uint8_t *address)
 {
     uint32_t addrLo;
     uint32_t addrHi;    
-    memcpy(&addrLo, address, sizeof(addrLo));
-    address += sizeof(addrLo);
-    memcpy(&addrHi, address, sizeof(addrHi));
+
+    TO_UINT32(address, addrHi);
+    TO_UINT32(address + 4, addrLo);
 
     ZLL->MACLONGADDRS0_LSB = addrLo;
     ZLL->MACLONGADDRS0_MSB = addrHi;    
