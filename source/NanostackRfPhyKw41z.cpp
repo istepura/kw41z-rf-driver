@@ -1,6 +1,9 @@
 /*
    Copyright 2017, Igor Stepura <igor.stepura@gmail.com>
 
+   Inspired by mcr20a-rf-driver by Andrei Kovacs <Andrei.Kovacs@freescale.com>
+   and NXP KW41Z 802.15.4 PHY implementation
+
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at
@@ -62,10 +65,6 @@ enum {
   gInvalidCcaType_c    /* illegal type */
 };
 
-enum {
-  gNormalCca_c,
-  gContinuousCca_c
-};
 static phyPwrMode_t mPhyPwrState = gPhyPwrIdle_c;
 #ifndef MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS
 #define MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS  {1, 2, 3, 4, 5, 6, 7, 8}
@@ -268,10 +267,7 @@ static void rf_init(void)
     /* Set Rx watermark level */
     ZLL->RX_WTR_MARK = 0;
 
-    /*Read eui64*/
-    //rf_set_address(MAC_address);
     rf_channel_set(MBED_CONF_MBED_MESH_API_6LOWPAN_ND_CHANNEL);
-    /*Start receiver*/
     
     /* DSM settings */
     phyReg = (RSIM->RF_OSC_CTRL & RSIM_RF_OSC_CTRL_BB_XTAL_READY_COUNT_SEL_MASK) >> 
@@ -334,9 +330,7 @@ static void rf_receive(void)
     ZLL->IRQSTS = irqSts;
 
     ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_XCVSEQ_MASK);
-    /* Start the RX sequence */
     ZLL->PHY_CTRL |= gRX_c ;
-    /* unmask SEQ interrupt */
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_SEQMSK_MASK;
 }
 
@@ -651,7 +645,7 @@ static void rf_abort(void)
  *
  * \return none
  */
-static volatile uint8_t gIrqStatus = 0;
+static volatile uint32_t gIrqStatus = 0;
 static void PHY_InterruptHandler(void)
 {
     gIrqStatus = ZLL->IRQSTS;
@@ -673,7 +667,7 @@ static void PHY_InterruptThread(void)
     }
 }
 
-static void PhyIsrSeqCleanup(void)
+static inline void rf_clean_seq_isr(void)
 {
     uint32_t irqStatus;
 
@@ -698,7 +692,7 @@ static void PhyIsrSeqCleanup(void)
     ZLL->IRQSTS = irqStatus;
 }
 
-static void PhyIsrTimeoutCleanup(void)
+static inline void rf_clean_timeout_isr(void)
 {
     uint32_t irqStatus;
 
@@ -777,7 +771,7 @@ static void rf_handle_rx_end(void)
 
 static void handle_interrupt(uint32_t irqStatus)
 {
- /* RSIM Wake-up IRQ */
+     /* RSIM Wake-up IRQ */
     if(RSIM->DSM_CONTROL & RSIM_DSM_CONTROL_ZIG_SYSCLK_REQ_INT_MASK)
     {
         RSIM->DSM_CONTROL = RSIM->DSM_CONTROL;
@@ -800,19 +794,19 @@ static void handle_interrupt(uint32_t irqStatus)
     {
         if( irqStatus & ZLL_IRQSTS_PLL_UNLOCK_IRQ_MASK )
         {
-            PhyIsrSeqCleanup();
+            rf_clean_seq_isr();
         }
         /* TMR3 timeout, the autosequence has been aborted due to TMR3 timeout */
         else if( (irqStatus & ZLL_IRQSTS_TMR3IRQ_MASK) &&
             (!(irqStatus & ZLL_IRQSTS_RXIRQ_MASK)) &&
             (gTX_c != xcvseqCopy) )
         {
-            PhyIsrTimeoutCleanup();
+            rf_clean_timeout_isr();
             device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_FAIL, 1, 1);
         }
         else
         {
-            PhyIsrSeqCleanup();
+            rf_clean_seq_isr();
             switch(xcvseqCopy)
             {
                 case gTX_c:
@@ -865,11 +859,6 @@ static void handle_interrupt(uint32_t irqStatus)
                         }
                     }
                     break;
-
-                case gCCCA_c:
-                    //Radio_Phy_PlmeCcaConfirm(gPhyChannelIdle_c, mPhyInstance);
-                    break;
-
                 default:
                     break;
             }
@@ -878,25 +867,13 @@ static void handle_interrupt(uint32_t irqStatus)
     /* Timers interrupt */
     else
     {
-        /* Timer 2 Compare Match */
-        if( (irqStatus & ZLL_IRQSTS_TMR2IRQ_MASK) && (!(irqStatus & ZLL_IRQSTS_TMR2MSK_MASK)) )
-        {
-            if( gIdle_c != xcvseqCopy )
-            {
-                //Radio_Phy_TimeStartEventIndication(mPhyInstance);
-            }
-        }
-
         /* Timer 3 Compare Match */
         if( (irqStatus & ZLL_IRQSTS_TMR3IRQ_MASK) && (!(irqStatus & ZLL_IRQSTS_TMR3MSK_MASK)) )
         {
 
-            /* Ensure that we're not issuing TimeoutIndication while the Automated sequence is still in progress */
-            /* TMR3 can expire during R-T turnaround for example, case in which the sequence is not interrupted */
             if( gIdle_c == xcvseqCopy )
             {
-                //device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_FAIL, 1, 1);
-                //Radio_Phy_TimeRxTimeoutIndication(mPhyInstance);
+                device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_FAIL, 1, 1);
             }
         }
 
@@ -930,7 +907,6 @@ static void rf_handle_tx_end(uint8_t rx_frame_pending)
         }
         else
         {
-            // arm_net_phy_tx_done(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_SUCCESS, 1, 1);
             device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_DONE, 1, 1);
         }
     }

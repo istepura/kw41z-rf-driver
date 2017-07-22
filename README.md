@@ -1,5 +1,5 @@
 # kw41z-rf-driver
-ARM mbed Nanostack RF driver for NXP KW4xZ 802.15.4 wireless MCU
+ARM mbed Nanostack RF driver for NXP KW41Z/21Z 802.15.4 wireless MCU
 
 This driver is used with 6LoWPAN stack. 
 
