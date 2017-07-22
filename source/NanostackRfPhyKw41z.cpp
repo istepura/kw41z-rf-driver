@@ -1,3 +1,19 @@
+/*
+   Copyright 2017, Igor Stepura <igor.stepura@gmail.com>
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 #include "NanostackRfPhyKw41z.h"
 #include "ns_types.h"
 #include "platform/arm_hal_interrupt.h"
@@ -32,7 +48,6 @@ enum {
   gChannelBusy_c
 };
 
-/* PANCORDNTR bit in PP */
 enum {
   gMacRole_DeviceOrCoord_c,
   gMacRole_PanCoord_c
@@ -52,14 +67,21 @@ enum {
   gContinuousCca_c
 };
 static phyPwrMode_t mPhyPwrState = gPhyPwrIdle_c;
-static uint8_t MAC_address[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+#ifndef MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS
+#define MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS  {1, 2, 3, 4, 5, 6, 7, 8}
+#endif
+
+#ifndef MBED_CONF_MBED_MESH_API_6LOWPAN_ND_CHANNEL
+#define MBED_CONF_MBED_MESH_API_6LOWPAN_ND_CHANNEL (12)
+#endif
+
+static uint8_t MAC_address[8] = MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS;
 static NanostackRfPhyKw41z *rf = NULL;
 static Thread irq_thread(osPriorityRealtime, 1024);
 static phy_device_driver_s device_driver;
 static int8_t  rf_radio_driver_id = -1;
 static uint8_t  mac_tx_handle = 0;
 
-static uint8_t                         mPhyIrqDisableCnt = 1;
 static uint8_t rf_phy_channel = 0;
 static uint8_t  need_ack = 0;
 
@@ -113,6 +135,7 @@ MBED_UNUSED static void rf_mac64_read(uint8_t *address);
 MBED_UNUSED static void    rf_set_power_state(phyPwrMode_t newState);
 MBED_UNUSED static void rf_handle_tx_end(uint8_t);
 static void rf_set_address(uint8_t *address);
+
 static inline phySeqState_t rf_get_state(void)
 {
     return (phySeqState_t)(((ZLL->PHY_CTRL & ZLL_PHY_CTRL_XCVSEQ_MASK) >> ZLL_PHY_CTRL_XCVSEQ_SHIFT));
@@ -133,36 +156,22 @@ static void rf_if_unlock(void)
     platform_exit_critical();
 }
 
-static phyStatus_t PhyPlmeSetPwrLevelRequest
-(
-  uint8_t pwrStep
-)
+static void rf_set_power_level( uint8_t pwrStep)
 {
-    phyStatus_t status = gPhySuccess_c;
-#ifdef PHY_PARAMETERS_VALIDATION
-    if( pwrStep > 32 )
+    /* Do not exceed the Tx power limit for the current channel */
+    if( pwrStep > gPhyChannelTxPowerLimits[ZLL->CHANNEL_NUM0 - 11] )
     {
-        status = gPhyInvalidParameter_c;
+        pwrStep = gPhyChannelTxPowerLimits[ZLL->CHANNEL_NUM0 - 11];
     }
-    else
-#endif /* PHY_PARAMETERS_VALIDATION */
+    if( pwrStep > 2 )
     {
-        /* Do not exceed the Tx power limit for the current channel */
-        if( pwrStep > gPhyChannelTxPowerLimits[ZLL->CHANNEL_NUM0 - 11] )
-        {
-            pwrStep = gPhyChannelTxPowerLimits[ZLL->CHANNEL_NUM0 - 11];
-        }
-        if( pwrStep > 2 )
-        {
-            pwrStep = (pwrStep << 1) - 2;
-        }
-        
-        ZLL->PA_PWR = pwrStep;
+        pwrStep = (pwrStep << 1) - 2;
     }
-    return status;
+
+    ZLL->PA_PWR = pwrStep;
 }
 
-static uint8_t PhyPlmeGetPwrLevelRequest(void)
+static uint8_t rf_get_power_level(void)
 {
     uint8_t pwrStep = (uint8_t)ZLL->PA_PWR;
 
@@ -174,73 +183,24 @@ static uint8_t PhyPlmeGetPwrLevelRequest(void)
     return pwrStep;
 }
 
-static phyStatus_t PhyPlmeSetCurrentChannelRequest
-(
-  uint8_t channel,
-  uint8_t pan
-)
-{
-    phyStatus_t status = gPhySuccess_c;
-#ifdef PHY_PARAMETERS_VALIDATION
-    if((channel < 11) || (channel > 26))
-    {
-        status = gPhyInvalidParameter_c;
-    }
-    else
-#endif /* PHY_PARAMETERS_VALIDATION */
-    {
-        if( !pan )
-        {
-            ZLL->CHANNEL_NUM0 = channel;
-        }
-        else
-        {
-            ZLL->CHANNEL_NUM1 = channel;
-        }
-        
-        /* Make sure the current Tx power doesn't exceed the Tx power limit for the new channel */
-        if( PhyPlmeGetPwrLevelRequest() > gPhyChannelTxPowerLimits[channel - 11] )
-        {
-            PhyPlmeSetPwrLevelRequest(gPhyChannelTxPowerLimits[channel - 11]);
-        }
-    }
-    
-    return status;
-}
-static void UnprotectFromXcvrInterrupt(void)
-{
-    platform_enter_critical();
-    
-    if( mPhyIrqDisableCnt )
-    {
-        mPhyIrqDisableCnt--;
-        
-        if( mPhyIrqDisableCnt == 0 )
-        {
-            ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TRCV_MSK_MASK;
-        }
-    }
-
-    platform_exit_critical();
-}
-#ifndef gPhyIrqPriority_c
-#define gPhyIrqPriority_c     (0x80)
-#endif
 #define gPhyIrqNo_d           (Radio_1_IRQn)
 static void PHY_InstallIsr()
 {
     NVIC_SetVector(gPhyIrqNo_d, (uint32_t)&PHY_InterruptHandler);
     NVIC_ClearPendingIRQ(gPhyIrqNo_d);
     NVIC_EnableIRQ(gPhyIrqNo_d);    
-    /* set transceiver interrupt priority */
-    //NVIC_SetPriority(gPhyIrqNo_d, gPhyIrqPriority_c >> (8 - __NVIC_PRIO_BITS));
-    UnprotectFromXcvrInterrupt();    
 }
 
 static void rf_channel_set(uint8_t channel)
 {
     rf_phy_channel = channel;
-    PhyPlmeSetCurrentChannelRequest(channel, 0);
+
+    ZLL->CHANNEL_NUM0 = channel;
+
+    if( rf_get_power_level() > gPhyChannelTxPowerLimits[channel - 11] )
+    {
+        rf_set_power_level(gPhyChannelTxPowerLimits[channel - 11]);
+    }
 }
 
 static void rf_init(void)
@@ -293,7 +253,7 @@ static void rf_init(void)
     ZLL->CCA_LQI_CTRL |= ZLL_CCA_LQI_CTRL_CCA1_THRESH(0xB5);
 
     /* Set the default power level */
-    PhyPlmeSetPwrLevelRequest(gPhyDefaultTxPowerLevel_d);
+    rf_set_power_level(gPhyDefaultTxPowerLevel_d);
 
     /* Adjust ACK delay to fulfill the 802.15.4 turnaround requirements */
     ZLL->ACKDELAY &= ~ZLL_ACKDELAY_ACKDELAY_MASK;
@@ -310,8 +270,7 @@ static void rf_init(void)
 
     /*Read eui64*/
     //rf_set_address(MAC_address);
-    /*set default channel to 11*/
-    rf_channel_set(12);
+    rf_channel_set(MBED_CONF_MBED_MESH_API_6LOWPAN_ND_CHANNEL);
     /*Start receiver*/
     
     /* DSM settings */
@@ -322,6 +281,7 @@ static void rf_init(void)
 
     /* Install PHY ISR */
     PHY_InstallIsr();
+    ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TRCV_MSK_MASK;
     rf_receive();    
 }
 
@@ -834,31 +794,10 @@ static void handle_interrupt(uint32_t irqStatus)
         /* Adjust the 802.15.4 EVENT_TMR */
         timeAdjust = (timeAdjust - RSIM->ZIG_SLEEP)/32768U * 1000000U; /* [us] */
         ZLL->EVENT_TMR = (timeAdjust << 4) | ZLL_EVENT_TMR_EVENT_TMR_ADD_MASK;
-        //Radio_Phy_TimeRxTimeoutIndication(mPhyInstance);
     }
 
-    /* Flter Fail IRQ */
-    if( irqStatus & ZLL_IRQSTS_FILTERFAIL_IRQ_MASK )
-    {
-    }
-    /* Rx Watermark IRQ */
-    else
-    {
-        if( (!(ZLL->PHY_CTRL & ZLL_PHY_CTRL_RX_WMRK_MSK_MASK)) && (irqStatus & ZLL_IRQSTS_RXWTRMRKIRQ_MASK) )
-        {
-            uint32_t length = (irqStatus & ZLL_IRQSTS_RX_FRAME_LENGTH_MASK) >> ZLL_IRQSTS_RX_FRAME_LENGTH_SHIFT;
-        }
-    }
-
-    /* Timer 1 Compare Match */
-    if( (irqStatus & ZLL_IRQSTS_TMR1IRQ_MASK) && (!(irqStatus & ZLL_IRQSTS_TMR1MSK_MASK)) )
-    {
-    }
-
-    /* Sequencer interrupt, the autosequence has completed */
     if( (!(ZLL->PHY_CTRL & ZLL_PHY_CTRL_SEQMSK_MASK)) && (irqStatus & ZLL_IRQSTS_SEQIRQ_MASK) )
     {
-        /* PLL unlock, the autosequence has been aborted due to PLL unlock */
         if( irqStatus & ZLL_IRQSTS_PLL_UNLOCK_IRQ_MASK )
         {
             PhyIsrSeqCleanup();
@@ -876,63 +815,63 @@ static void handle_interrupt(uint32_t irqStatus)
             PhyIsrSeqCleanup();
             switch(xcvseqCopy)
             {
-            case gTX_c:
-                if( (ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCABFRTX_MASK) && (irqStatus & ZLL_IRQSTS_CCA_MASK ) )
-                {
-                     device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
-                }
-                else
-                {
-                    ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_XCVSEQ_MASK;
-                    /* wait for Sequence Idle (if not already) */
-                    ZLL->PHY_CTRL |= (ZLL_PHY_CTRL_CCAMSK_MASK |
-                            ZLL_PHY_CTRL_RXMSK_MASK |
-                            ZLL_PHY_CTRL_TXMSK_MASK |
-                            ZLL_PHY_CTRL_SEQMSK_MASK);
-                    while( ZLL->SEQ_STATE & ZLL_SEQ_STATE_SEQ_STATE_MASK ) {}
-                    rf_handle_tx_end(0);
-                }
-                break;
-                
-            case gTR_c:
-                if( (ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCABFRTX_MASK) && (irqStatus & ZLL_IRQSTS_CCA_MASK ) )
-                {
-                    device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
-                }
-                else
-                {
-                    rf_handle_tx_end((irqStatus & ZLL_IRQSTS_RX_FRM_PEND_MASK) > 0);
-
-                }
-                break;
-                
-            case gRX_c:
-                rf_handle_rx_end();
-                break;
-                
-            case gCCA_c:
-                if( gCcaED_c == ((ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCATYPE_MASK) >> ZLL_PHY_CTRL_CCATYPE_SHIFT) )
-                {
-                    //Radio_Phy_PlmeEdConfirm( (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_CCA1_ED_FNL_MASK) >> ZLL_LQI_AND_RSSI_CCA1_ED_FNL_SHIFT, mPhyInstance );
-                }
-                else /* CCA */
-                {
-                    if( irqStatus & ZLL_IRQSTS_CCA_MASK )
+                case gTX_c:
+                    if( (ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCABFRTX_MASK) && (irqStatus & ZLL_IRQSTS_CCA_MASK ) )
                     {
                         device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
                     }
                     else
                     {
+                        ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_XCVSEQ_MASK;
+                        /* wait for Sequence Idle (if not already) */
+                        ZLL->PHY_CTRL |= (ZLL_PHY_CTRL_CCAMSK_MASK |
+                                ZLL_PHY_CTRL_RXMSK_MASK |
+                                ZLL_PHY_CTRL_TXMSK_MASK |
+                                ZLL_PHY_CTRL_SEQMSK_MASK);
+                        while( ZLL->SEQ_STATE & ZLL_SEQ_STATE_SEQ_STATE_MASK ) {}
+                        rf_handle_tx_end(0);
                     }
-                }
-                break;
-                
-            case gCCCA_c:
-                //Radio_Phy_PlmeCcaConfirm(gPhyChannelIdle_c, mPhyInstance);
-                break;
-                
-            default:
-                break;
+                    break;
+
+                case gTR_c:
+                    if( (ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCABFRTX_MASK) && (irqStatus & ZLL_IRQSTS_CCA_MASK ) )
+                    {
+                        device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
+                    }
+                    else
+                    {
+                        rf_handle_tx_end((irqStatus & ZLL_IRQSTS_RX_FRM_PEND_MASK) > 0);
+
+                    }
+                    break;
+
+                case gRX_c:
+                    rf_handle_rx_end();
+                    break;
+
+                case gCCA_c:
+                    if( gCcaED_c == ((ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCATYPE_MASK) >> ZLL_PHY_CTRL_CCATYPE_SHIFT) )
+                    {
+                        //Radio_Phy_PlmeEdConfirm( (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_CCA1_ED_FNL_MASK) >> ZLL_LQI_AND_RSSI_CCA1_ED_FNL_SHIFT, mPhyInstance );
+                    }
+                    else /* CCA */
+                    {
+                        if( irqStatus & ZLL_IRQSTS_CCA_MASK )
+                        {
+                            device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
+                        }
+                        else
+                        {
+                        }
+                    }
+                    break;
+
+                case gCCCA_c:
+                    //Radio_Phy_PlmeCcaConfirm(gPhyChannelIdle_c, mPhyInstance);
+                    break;
+
+                default:
+                    break;
             }
         }
     }

@@ -4,7 +4,8 @@
   "description": "RF driver for NXP KW41Z",
   "keywords": [
     "rf",
-    "driver"
+    "driver",
+    "nanostack"
   ],
   "author": "Igor Stepura <igor.stepura@gmail.com>",
   "license": "Apache-2.0",
