@@ -37,12 +37,8 @@ typedef enum {
 }phySeqState_t;
 
 typedef enum{
-    gPhyPwrIdle_c,
-    gPhyPwrAutodoze_c,
-    gPhyPwrDoze_c,
-    gPhyPwrHibernate_c,
+    gPhyPwrRun_c,
     gPhyPwrDSM_c,
-    gPhyPwrReset_c
 }phyPwrMode_t;
 
 /* PHY channel state */
@@ -65,7 +61,7 @@ enum {
   gInvalidCcaType_c    /* illegal type */
 };
 
-static phyPwrMode_t mPhyPwrState = gPhyPwrIdle_c;
+static phyPwrMode_t mPhyPwrState = gPhyPwrRun_c;
 #ifndef MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS
 #define MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS  {1, 2, 3, 4, 5, 6, 7, 8}
 #endif
@@ -76,7 +72,11 @@ static phyPwrMode_t mPhyPwrState = gPhyPwrIdle_c;
 
 static uint8_t MAC_address[8] = MBED_CONF_KW41Z_RF_LONG_MAC_ADDRESS;
 static NanostackRfPhyKw41z *rf = NULL;
+
+#ifdef MBED_CONF_RTOS_PRESENT
 static Thread irq_thread(osPriorityRealtime, 1024);
+#endif
+
 static phy_device_driver_s device_driver;
 static int8_t  rf_radio_driver_id = -1;
 static uint8_t  mac_tx_handle = 0;
@@ -321,7 +321,7 @@ static void rf_receive(void)
     {
         return;
     }
-    rf_set_power_state(gPhyPwrAutodoze_c);
+    rf_set_power_state(gPhyPwrRun_c);
 
     /* Ensure that no spurious interrupts are raised, but do not change TMR1 and TMR4 IRQ status */
     irqSts = ZLL->IRQSTS;
@@ -402,7 +402,7 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
     need_ack = (*data_ptr & 0x20) == 0x20;
 
     /* Set XCVR power state in run mode */
-    rf_set_power_state(gPhyPwrAutodoze_c);
+    rf_set_power_state(gPhyPwrRun_c);
 
     uint8_t xcvseq;    
     if(need_ack)
@@ -511,13 +511,7 @@ static int8_t rf_extension(phy_extension_type_e extension_type, uint8_t *data_pt
 static uint32_t mPhyDSMDuration = 0xFFFFF0;
 static void rf_set_power_state(phyPwrMode_t newState)
 {
-    /* Parameter validation */
-    if( newState > gPhyPwrReset_c )
-    {
-        return;
-    }
-    /* Check if the new power state = old power state */
-    else if( newState == mPhyPwrState )
+    if( newState == mPhyPwrState )
     {
         return;
     }
@@ -525,7 +519,7 @@ static void rf_set_power_state(phyPwrMode_t newState)
     {
         switch(newState)
         {
-            case gPhyPwrIdle_c:
+            case gPhyPwrRun_c:
                 /* Set XCVR in run mode if not allready */
                 if(RSIM->DSM_CONTROL & RSIM_DSM_CONTROL_ZIG_DEEP_SLEEP_STATUS_MASK)
                 {
@@ -547,11 +541,6 @@ static void rf_set_power_state(phyPwrMode_t newState)
                         RSIM_DSM_CONTROL_ZIG_SYSCLK_INTERRUPT_EN_MASK;
                 }
                 break;
-
-            default:
-                /* do not change current state */
-                newState = mPhyPwrState;
-                break;
         }
 
         mPhyPwrState = newState;
@@ -560,15 +549,12 @@ static void rf_set_power_state(phyPwrMode_t newState)
 
 static void rf_off(void)
 {
-    /* Abort any ongoing sequences */
     rf_abort();
-    /* Set XCVR in a low power state */
-    rf_set_power_state(gPhyPwrHibernate_c);
+    rf_set_power_state(gPhyPwrDSM_c);
 }
 
 static void rf_shutdown(void)
 {
-    /*Call RF OFF*/
     rf_off();
 }
 
@@ -650,21 +636,26 @@ static void PHY_InterruptHandler(void)
 {
     gIrqStatus = ZLL->IRQSTS;
     ZLL->IRQSTS = gIrqStatus;
+#ifdef MBED_CONF_RTOS_PRESENT
     irq_thread.signal_set(1);
+#else
+    handle_interrupt(gIrqStatus);
+#endif
+
 }
 
 static void PHY_InterruptThread(void)
 {
+#ifdef MBED_CONF_RTOS_PRESENT
     for (;;) {
         osEvent event = irq_thread.signal_wait(0);
         if (event.status != osEventSignal) {
             continue;
         }
-       // rf_if_lock();        
         handle_interrupt(gIrqStatus);
-       // rf_if_unlock();
 
     }
+#endif
 }
 
 static inline void rf_clean_seq_isr(void)
@@ -937,7 +928,9 @@ int8_t NanostackRfPhyKw41z::rf_register()
         return -1;
     }
 
+#ifdef MBED_CONF_RTOS_PRESENT
     irq_thread.start(mbed::callback(PHY_InterruptThread));
+#endif
 
     int8_t radio_id = rf_device_register();
     if (radio_id < 0) {
