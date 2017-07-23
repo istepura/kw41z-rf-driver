@@ -101,6 +101,12 @@ static const phy_device_channel_page_s phy_channel_pages[] = {
 #endif
 #define CORE_CLOCK_FREQ 47972352U
 #define gPhyMaxTxPowerLevel_d         (32)
+
+#define ZLL_IRQSTS_TMRMSK_MASK  (ZLL_IRQSTS_TMR1MSK_MASK | \
+                                      ZLL_IRQSTS_TMR2MSK_MASK | \
+                                      ZLL_IRQSTS_TMR3MSK_MASK | \
+                                      ZLL_IRQSTS_TMR4MSK_MASK )
+
 uint8_t gPhyChannelTxPowerLimits[] = { gPhyMaxTxPowerLevel_d,   /* 11 */ \
                                  gPhyMaxTxPowerLevel_d,   /* 12 */ \
                                  gPhyMaxTxPowerLevel_d,   /* 13 */ \
@@ -133,6 +139,8 @@ MBED_UNUSED static void rf_receive(void);
 MBED_UNUSED static void rf_mac64_read(uint8_t *address);
 MBED_UNUSED static void    rf_set_power_state(phyPwrMode_t newState);
 MBED_UNUSED static void rf_handle_tx_end(uint8_t);
+static void rf_set_timeout(uint32_t timeout);
+static inline uint32_t rf_get_timestamp(void);
 static void rf_set_address(uint8_t *address);
 
 static inline phySeqState_t rf_get_state(void)
@@ -200,6 +208,27 @@ static void rf_channel_set(uint8_t channel)
     {
         rf_set_power_level(gPhyChannelTxPowerLimits[channel - 11]);
     }
+}
+
+static inline uint32_t rf_get_timestamp(void)
+{
+    uint32_t retval = ZLL->EVENT_TMR >> ZLL_EVENT_TMR_EVENT_TMR_SHIFT;
+
+    return retval;
+}
+
+static void rf_set_timeout(uint32_t timeout)
+{
+    ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TMR3CMP_EN_MASK;
+    ZLL->T3CMP = timeout & 0x00FFFFFF;
+
+    uint32_t sts = ZLL->IRQSTS & ZLL_IRQSTS_TMRMSK_MASK;
+    sts &= ~(ZLL_IRQSTS_TMR3MSK_MASK);
+    sts |= ZLL_IRQSTS_TMR3IRQ_MASK;
+    ZLL->IRQSTS = sts;
+
+    ZLL->PHY_CTRL |= ZLL_PHY_CTRL_TMR3CMP_EN_MASK;
+    ZLL->PHY_CTRL |= ZLL_PHY_CTRL_TC3TMOUT_MASK;
 }
 
 static void rf_init(void)
@@ -323,9 +352,7 @@ static void rf_receive(void)
     }
     rf_set_power_state(gPhyPwrRun_c);
 
-    /* Ensure that no spurious interrupts are raised, but do not change TMR1 and TMR4 IRQ status */
     irqSts = ZLL->IRQSTS;
-    irqSts &= ~(ZLL_IRQSTS_TMR1IRQ_MASK | ZLL_IRQSTS_TMR4IRQ_MASK);
     irqSts |= ZLL_IRQSTS_TMR3MSK_MASK;
     ZLL->IRQSTS = irqSts;
 
@@ -398,6 +425,8 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_CCATYPE_MASK;
     ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCATYPE(gCcaCCA_MODE1_c);
 
+    ZLL->IRQSTS = ZLL->IRQSTS;
+
     mac_tx_handle = tx_handle;
     need_ack = (*data_ptr & 0x20) == 0x20;
 
@@ -409,24 +438,20 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
     {
         ZLL->PHY_CTRL |= ZLL_PHY_CTRL_RXACKRQD_MASK;
         xcvseq = gTR_c;
-    
     }
     else
     {
         ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_RXACKRQD_MASK;
         xcvseq = gTX_c;        
-    }    
-    uint32_t irqSts;
-    /* Ensure that no spurious interrupts are raised(do not change TMR1 and TMR4 IRQ status) */
-    irqSts = ZLL->IRQSTS;
-    irqSts &= ~(ZLL_IRQSTS_TMR1IRQ_MASK | ZLL_IRQSTS_TMR4IRQ_MASK);
-    irqSts |= ZLL_IRQSTS_TMR3MSK_MASK;
-    ZLL->IRQSTS = irqSts;
 
+        uint32_t timeout = rf_get_timestamp();
+        timeout += ((XCVR_TSM->END_OF_SEQ & XCVR_TSM_END_OF_SEQ_END_OF_TX_WU_MASK) >> XCVR_TSM_END_OF_SEQ_END_OF_TX_WU_SHIFT) >> 4;
+        timeout += 50; /* Maigic numbers are the best!! */
+
+        rf_set_timeout(timeout);
+    }    
     ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_XCVSEQ_MASK);
-    /* Start the TX / TRX / CCA sequence */
     ZLL->PHY_CTRL |= xcvseq;
-    /* Unmask SEQ interrupt */
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_SEQMSK_MASK;    
 
     return 0;
@@ -435,7 +460,6 @@ static int8_t rf_start_cca(uint8_t *data_ptr, uint16_t data_length, uint8_t tx_h
 static void rf_set_short_adr(uint8_t * short_address)
 {
     uint16_t value = ((uint16_t)short_address[0] << 8) | (uint16_t)short_address[1];
-    //memcpy(&value, short_address, sizeof(value));
     ZLL->MACSHORTADDRS0 &= ~ZLL_MACSHORTADDRS0_MACSHORTADDRS0_MASK;
     ZLL->MACSHORTADDRS0 |= ZLL_MACSHORTADDRS0_MACSHORTADDRS0(value);    
 }
@@ -618,19 +642,10 @@ static void rf_abort(void)
     ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_TMR2CMP_EN_MASK |
             ZLL_PHY_CTRL_TMR3CMP_EN_MASK |
             ZLL_PHY_CTRL_TC3TMOUT_MASK );
-    /* clear all PP IRQ bits to avoid unexpected interrupts( do not change TMR1 and TMR4 IRQ status ) */
     ZLL->IRQSTS &= ~(ZLL_IRQSTS_TMR1IRQ_MASK | ZLL_IRQSTS_TMR4IRQ_MASK);
 }
 
 
-
-/*
- * \brief Function is a RF interrupt vector. End of frame in RX and TX are handled here as well as CCA process interrupt.
- *
- * \param none
- *
- * \return none
- */
 static volatile uint32_t gIrqStatus = 0;
 static void PHY_InterruptHandler(void)
 {
@@ -673,37 +688,10 @@ static inline void rf_clean_seq_isr(void)
     while( ZLL->SEQ_STATE & ZLL_SEQ_STATE_SEQ_STATE_MASK ) {}
 
     irqStatus = ZLL->IRQSTS;
-    /* Mask TMR3 interrupt */
     irqStatus |= ZLL_IRQSTS_TMR3MSK_MASK;
-    /* Clear transceiver interrupts except TMRxIRQ */
     irqStatus &= ~( ZLL_IRQSTS_TMR1IRQ_MASK |
                     ZLL_IRQSTS_TMR2IRQ_MASK |
                     ZLL_IRQSTS_TMR3IRQ_MASK |
-                    ZLL_IRQSTS_TMR4IRQ_MASK );
-    ZLL->IRQSTS = irqStatus;
-}
-
-static inline void rf_clean_timeout_isr(void)
-{
-    uint32_t irqStatus;
-
-    /* Set the PHY sequencer back to IDLE and disable TMR3 comparator and timeout */
-    ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_TMR3CMP_EN_MASK | 
-                       ZLL_PHY_CTRL_TC3TMOUT_MASK   | 
-                       ZLL_PHY_CTRL_XCVSEQ_MASK);
-    /* Mask SEQ, RX, TX and CCA interrupts */
-    ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCAMSK_MASK |
-                     ZLL_PHY_CTRL_RXMSK_MASK  |
-                     ZLL_PHY_CTRL_TXMSK_MASK  |
-                     ZLL_PHY_CTRL_SEQMSK_MASK;
-
-    while( ZLL->SEQ_STATE & ZLL_SEQ_STATE_SEQ_STATE_MASK ) {}
-
-    irqStatus = ZLL->IRQSTS;
-    /* Mask TMR3 interrupt */
-    irqStatus |= ZLL_IRQSTS_TMR3MSK_MASK;
-    /* Clear transceiver interrupts except TMR1IRQ and TMR4IRQ. */
-    irqStatus &= ~( ZLL_IRQSTS_TMR1IRQ_MASK |
                     ZLL_IRQSTS_TMR4IRQ_MASK );
     ZLL->IRQSTS = irqStatus;
 }
@@ -792,7 +780,9 @@ static void handle_interrupt(uint32_t irqStatus)
             (!(irqStatus & ZLL_IRQSTS_RXIRQ_MASK)) &&
             (gTX_c != xcvseqCopy) )
         {
-            rf_clean_timeout_isr();
+            ZLL->IRQSTS = irqStatus | ZLL_IRQSTS_TMR3MSK_MASK;
+            ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TMR3CMP_EN_MASK;
+
             device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_FAIL, 1, 1);
         }
         else
@@ -808,7 +798,6 @@ static void handle_interrupt(uint32_t irqStatus)
                     else
                     {
                         ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_XCVSEQ_MASK;
-                        /* wait for Sequence Idle (if not already) */
                         ZLL->PHY_CTRL |= (ZLL_PHY_CTRL_CCAMSK_MASK |
                                 ZLL_PHY_CTRL_RXMSK_MASK |
                                 ZLL_PHY_CTRL_TXMSK_MASK |
@@ -845,40 +834,11 @@ static void handle_interrupt(uint32_t irqStatus)
                         {
                             device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
                         }
-                        else
-                        {
-                        }
                     }
                     break;
                 default:
                     break;
             }
-        }
-    }
-    /* Timers interrupt */
-    else
-    {
-        /* Timer 3 Compare Match */
-        if( (irqStatus & ZLL_IRQSTS_TMR3IRQ_MASK) && (!(irqStatus & ZLL_IRQSTS_TMR3MSK_MASK)) )
-        {
-
-            if( gIdle_c == xcvseqCopy )
-            {
-                device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_TX_FAIL, 1, 1);
-            }
-        }
-
-        /* Timer 4 Compare Match */
-        if( (irqStatus & ZLL_IRQSTS_TMR4IRQ_MASK) && (!(irqStatus & ZLL_IRQSTS_TMR4MSK_MASK)) )
-        {
-            /* Disable TMR4 comparator */
-            ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TMR4CMP_EN_MASK;
-            /* Mask and clear TMR4 interrupt (do not change other IRQ status) */
-            irqStatus &= ~( ZLL_IRQSTS_TMR1MSK_MASK |
-                            ZLL_IRQSTS_TMR2MSK_MASK |
-                            ZLL_IRQSTS_TMR3MSK_MASK );
-            irqStatus |= ZLL_IRQSTS_TMR4IRQ_MASK | ZLL_IRQSTS_TMR4MSK_MASK;
-            ZLL->IRQSTS = irqStatus;
         }
     }
 }
