@@ -142,6 +142,7 @@ MBED_UNUSED static void rf_handle_tx_end(uint8_t);
 static void rf_set_timeout(uint32_t timeout);
 static inline uint32_t rf_get_timestamp(void);
 static void rf_set_address(uint8_t *address);
+static uint8_t rf_detect_channel_energy(void);
 
 static inline phySeqState_t rf_get_state(void)
 {
@@ -231,6 +232,35 @@ static void rf_set_timeout(uint32_t timeout)
     ZLL->PHY_CTRL |= ZLL_PHY_CTRL_TC3TMOUT_MASK;
 }
 
+static uint8_t rf_detect_channel_energy(void)
+{
+    if (rf_get_state() !=gIdle_c)
+    {
+        return 0;
+    }
+    rf_set_power_state(gPhyPwrRun_c);
+
+    ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_CCATYPE_MASK;
+    ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCAMSK_MASK |
+                     ZLL_PHY_CTRL_RXMSK_MASK  |
+                     ZLL_PHY_CTRL_TXMSK_MASK  |
+                     ZLL_PHY_CTRL_SEQMSK_MASK;
+
+    ZLL->PHY_CTRL |= ZLL_PHY_CTRL_CCATYPE(gCcaED_c);
+
+    ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_XCVSEQ_MASK);
+    ZLL->PHY_CTRL |= gCCA_c;
+
+    /* Busy wait. No interrupt will be raised */
+    while (!(ZLL->IRQSTS & ZLL_IRQSTS_SEQIRQ_MASK)){}
+    ZLL->IRQSTS = ZLL->IRQSTS;
+    ZLL->PHY_CTRL &= ~(ZLL_PHY_CTRL_XCVSEQ_MASK);
+
+    int8_t caa1_ed_fnl = (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_CCA1_ED_FNL_MASK) >> ZLL_LQI_AND_RSSI_CCA1_ED_FNL_SHIFT;
+
+    return 128 + caa1_ed_fnl;
+}
+
 static void rf_init(void)
 {
     uint32_t phyReg;
@@ -307,6 +337,7 @@ static void rf_init(void)
     /* Install PHY ISR */
     PHY_InstallIsr();
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TRCV_MSK_MASK;
+
     rf_receive();    
 }
 
@@ -523,9 +554,11 @@ static int8_t rf_extension(phy_extension_type_e extension_type, uint8_t *data_pt
         case PHY_EXTENSION_READ_LAST_ACK_PENDING_STATUS:
             *data_ptr = ((ZLL->IRQSTS & ZLL_IRQSTS_RX_FRM_PEND_MASK) >> ZLL_IRQSTS_RX_FRM_PEND_SHIFT);
             break;        
-        /*Read energy on the channel*/
+        case PHY_EXTENSION_SET_CHANNEL:
+            rf_channel_set(*data_ptr);
+            break;
         case PHY_EXTENSION_READ_CHANNEL_ENERGY:
-            *data_ptr = 100;
+            *data_ptr = rf_detect_channel_energy();
             break;            
     }    
     return 0;
@@ -710,6 +743,14 @@ static inline uint8_t rf_convert_lqi(uint8_t rssi)
     return rssi;
 }
 
+static inline int8_t rf_lqi_to_rssi(uint8_t lqi)
+{
+    /* As per NXP's PHY implemenation */
+    int32_t rssi = (36 * lqi - 9836) / 109;
+
+    return (int8_t)rssi;
+}
+
 static void rf_handle_rx_end(void)
 {
     uint32_t irqSts;
@@ -719,17 +760,16 @@ static void rf_handle_rx_end(void)
     /* disable autosequence stop by TC3 match */
     ZLL->PHY_CTRL &= ~ZLL_PHY_CTRL_TC3TMOUT_MASK;
     /* mask TMR3 interrupt (do not change other IRQ status) */
-    irqSts  = ZLL->IRQSTS & (ZLL_IRQSTS_TMR1MSK_MASK |
-            ZLL_IRQSTS_TMR2MSK_MASK |
-            ZLL_IRQSTS_TMR3MSK_MASK |
-            ZLL_IRQSTS_TMR4MSK_MASK );
+    irqSts  = ZLL->IRQSTS & ZLL_IRQSTS_TMR3MSK_MASK;
     irqSts |= ZLL_IRQSTS_TMR3MSK_MASK;
     /* aknowledge TMR3 IRQ */
     irqSts |= ZLL_IRQSTS_TMR3IRQ_MASK;
     ZLL->IRQSTS = irqSts;
 
-    uint8_t rssi = (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_LQI_VALUE_MASK) >> ZLL_LQI_AND_RSSI_LQI_VALUE_SHIFT;
-    uint8_t lqi = rf_convert_lqi(rssi);
+    uint8_t phyRssi = (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_LQI_VALUE_MASK) >> ZLL_LQI_AND_RSSI_LQI_VALUE_SHIFT;
+    uint8_t lqi = rf_convert_lqi(phyRssi);
+    int8_t  rssi = rf_lqi_to_rssi(lqi);
+
     uint8_t psduLength = (ZLL->IRQSTS & ZLL_IRQSTS_RX_FRAME_LENGTH_MASK) >> ZLL_IRQSTS_RX_FRAME_LENGTH_SHIFT; /* Including FCS (2 bytes) */
     uint8_t len = psduLength - 2;
 
@@ -821,20 +861,6 @@ static void handle_interrupt(uint32_t irqStatus)
 
                 case gRX_c:
                     rf_handle_rx_end();
-                    break;
-
-                case gCCA_c:
-                    if( gCcaED_c == ((ZLL->PHY_CTRL & ZLL_PHY_CTRL_CCATYPE_MASK) >> ZLL_PHY_CTRL_CCATYPE_SHIFT) )
-                    {
-                        //Radio_Phy_PlmeEdConfirm( (ZLL->LQI_AND_RSSI & ZLL_LQI_AND_RSSI_CCA1_ED_FNL_MASK) >> ZLL_LQI_AND_RSSI_CCA1_ED_FNL_SHIFT, mPhyInstance );
-                    }
-                    else /* CCA */
-                    {
-                        if( irqStatus & ZLL_IRQSTS_CCA_MASK )
-                        {
-                            device_driver.phy_tx_done_cb(rf_radio_driver_id, mac_tx_handle, PHY_LINK_CCA_FAIL, 1, 1);
-                        }
-                    }
                     break;
                 default:
                     break;
